@@ -8,8 +8,8 @@
 #include <Adafruit_Sensor.h>
 
 // Replace with your network credentials
-const char* ssid = "Sarah";
-const char* password = "bakerwpa";
+const char* ssid = "     ";
+const char* password = "     ";
 
 // IP address
 IPAddress local_ip(192, 168, 1, 1);
