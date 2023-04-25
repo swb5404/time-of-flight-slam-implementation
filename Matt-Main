@@ -1,56 +1,304 @@
-
 #include <WiFi.h>
-#include <WebServer.h>
+#include <SPI.h>
+#include "driver/gpio.h"
+#include <chrono>
 
-#include "index_page.h"
+extern "C"
+{
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
+}
+// #include <WebServer.h>
 #include "tof_esp.h"
+#include <Wire.h>
+#include <Adafruit_L3GD20.h>
+#include <AsyncMqttClient.h>
+void sendData();
+
+// Gyro Sensor //////////////////////////////////////
+
+// To use SPI, you have to define the pins
+#define GYRO_CS 5   // labeled CS
+#define GYRO_DO 23  // labeled SA0
+#define GYRO_DI 19  // labeled SDA
+#define GYRO_CLK 18 // labeled SCL
+#define L3GD20_ADDRESS (0x6B)
+Adafruit_L3GD20 gyro(GYRO_CS, GYRO_DO, GYRO_DI, GYRO_CLK);
+const float dt = 1 / (2 * 250);
+float angle_x = 0;
+float angle_y = 0;
+float angle_z = 0;
+
 // #include "tof_point_cloud.h"
+#define SerialPort Serial
+#define SDA = 21
+#define SCL = 22
+#define DEV_I2C Wire(SDA, SCL)
+// #define WIFI_SSID "Chance the Router"
+// #define WIFI_PASSWORD "anchor206arrow"
 
-void handle_root();
+#define WIFI_SSID "iPhone."
+#define WIFI_PASSWORD "12345678"
 
-// SSID & Password
-const char *ssid = "Electripeak";   // Enter your SSID here
-const char *password = "123456789"; // Enter your Password here
+// #define MQTT_HOST IPAddress(10, 0, 0, 93)
+#define MQTT_HOST IPAddress(172, 20, 10, 3)
+#define MQTT_PORT 1883
 
-// IP Address details
-IPAddress local_ip(192, 168, 1, 1);
-IPAddress gateway(192, 168, 1, 1);
-IPAddress subnet(255, 255, 255, 0);
+// Components.
+VL53L4CX sensor_vl53l4cx_sat(&Wire, 25);
 
-WebServer server(80); // Object of WebServer(HTTP port, 80 is defult)
+// Server Details //////////////////////////////////
+
+AsyncMqttClient mqttClient;
+TimerHandle_t mqttReconnectTimer;
+TimerHandle_t wifiReconnectTimer;
+
+// ThingSpeak
+// unsigned long myChannelNumber = 2108949;
+// const char *myWriteAPIKey = "DXBC5DJWB1TBLSLE";
+
+void connectToWifi()
+{
+    Serial.println("Connecting to Wi-Fi...");
+    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+}
+
+void connectToMqtt()
+{
+    Serial.println("Connecting to MQTT...");
+    mqttClient.connect();
+}
+
+void WiFiEvent(WiFiEvent_t event)
+{
+    Serial.printf("[WiFi-event] event: %d\n", event);
+    switch (event)
+    {
+    case SYSTEM_EVENT_STA_GOT_IP:
+        Serial.println("WiFi connected");
+        Serial.println("IP address: ");
+        Serial.println(WiFi.localIP());
+        connectToMqtt();
+        break;
+    case SYSTEM_EVENT_STA_DISCONNECTED:
+        Serial.println("WiFi lost connection");
+        xTimerStop(mqttReconnectTimer, 0); // ensure we don't reconnect to MQTT while reconnecting to Wi-Fi
+        xTimerStart(wifiReconnectTimer, 0);
+        break;
+    }
+}
+
+void onMqttConnect(bool sessionPresent)
+{
+    Serial.println("Connected to MQTT.");
+    Serial.print("Session present: ");
+    Serial.println(sessionPresent);
+    uint16_t packetIdSub = mqttClient.subscribe("test/lol", 2);
+    Serial.print("Subscribing at QoS 2, packetId: ");
+    Serial.println(packetIdSub);
+    mqttClient.publish("test/lol", 0, true, "test 1");
+    Serial.println("Publishing at QoS 0");
+    uint16_t packetIdPub1 = mqttClient.publish("test/lol", 1, true, "test 2");
+    Serial.print("Publishing at QoS 1, packetId: ");
+    Serial.println(packetIdPub1);
+    uint16_t packetIdPub2 = mqttClient.publish("test/lol", 2, true, "test 3");
+    Serial.print("Publishing at QoS 2, packetId: ");
+    Serial.println(packetIdPub2);
+}
+
+void onMqttDisconnect(AsyncMqttClientDisconnectReason reason)
+{
+    Serial.println("Disconnected from MQTT.");
+
+    if (WiFi.isConnected())
+    {
+        xTimerStart(mqttReconnectTimer, 0);
+    }
+}
+
+void onMqttSubscribe(uint16_t packetId, uint8_t qos)
+{
+    Serial.println("Subscribe acknowledged.");
+    Serial.print("  packetId: ");
+    Serial.println(packetId);
+    Serial.print("  qos: ");
+    Serial.println(qos);
+}
+
+void onMqttUnsubscribe(uint16_t packetId)
+{
+    Serial.println("Unsubscribe acknowledged.");
+    Serial.print("  packetId: ");
+    Serial.println(packetId);
+}
+
+void onMqttMessage(char *topic, char *payload, AsyncMqttClientMessageProperties properties, size_t len, size_t index, size_t total)
+{
+    Serial.println("Publish received.");
+    Serial.print("  topic: ");
+    Serial.println(topic);
+    Serial.print("  qos: ");
+    Serial.println(properties.qos);
+    Serial.print("  dup: ");
+    Serial.println(properties.dup);
+    Serial.print("  retain: ");
+    Serial.println(properties.retain);
+    Serial.print("  len: ");
+    Serial.println(len);
+    Serial.print("  index: ");
+    Serial.println(index);
+    Serial.print("  total: ");
+    Serial.println(total);
+}
+
+void onMqttPublish(uint16_t packetId)
+{
+    Serial.println("Publish acknowledged.");
+    Serial.print("  packetId: ");
+    Serial.println(packetId);
+}
 
 void setup()
 {
+
     Serial.begin(115200);
+    Serial.print("ESP Board MAC Address:  ");
+    Serial.println(WiFi.macAddress());
 
-    // Create SoftAP
-    WiFi.softAP(ssid, password);
-    WiFi.softAPConfig(local_ip, gateway, subnet);
+    mqttReconnectTimer = xTimerCreate("mqttTimer", pdMS_TO_TICKS(2000), pdFALSE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(connectToMqtt));
+    wifiReconnectTimer = xTimerCreate("wifiTimer", pdMS_TO_TICKS(2000), pdFALSE, (void *)0, reinterpret_cast<TimerCallbackFunction_t>(connectToWifi));
 
-    Serial.print("Connect to My access point: ");
-    Serial.println(ssid);
+    WiFi.onEvent(WiFiEvent);
 
-    server.on("/", handle_root);
+    mqttClient.onConnect(onMqttConnect);
+    mqttClient.onDisconnect(onMqttDisconnect);
+    mqttClient.onSubscribe(onMqttSubscribe);
+    mqttClient.onUnsubscribe(onMqttUnsubscribe);
+    mqttClient.onMessage(onMqttMessage);
+    mqttClient.onPublish(onMqttPublish);
 
-    server.begin();
-    Serial.println("HTTP server started");
-    delay(100);
+    connectToWifi();
+    mqttClient.setServer(MQTT_HOST, MQTT_PORT);
+    mqttClient.connect();
 
-    tof_setup();
-    // tof_pc_setup();
+    mqttClient.publish("distance", 2, true, "0000");
+    mqttClient.subscribe("distance", 2);
+
+    mqttClient.publish("xData", 2, true, "0000");
+    mqttClient.publish("yData", 2, true, "0000");
+    mqttClient.publish("zData", 2, true, "0000");
+
+    mqttClient.publish("commands", 2, true, "0000");
+
+    // Initialize serial for output.
+    SerialPort.begin(115200);
+    SerialPort.println("Starting...");
+
+    // Initialize I2C bus.
+    Wire.begin();
+    SerialPort.println("Wire Begun");
+
+    // Configure VL53L4CX satellite component.
+    sensor_vl53l4cx_sat.begin();
+
+    // Switch off VL53L4CX satellite component.
+    sensor_vl53l4cx_sat.VL53L4CX_Off();
+
+    // Initialize VL53L4CX satellite component.
+    sensor_vl53l4cx_sat.InitSensor(0x29);
+
+    // Start Measurements
+    sensor_vl53l4cx_sat.VL53L4CX_StartMeasurement();
+
+    SerialPort.println("Attempting Gyro Initialization");
+
+    // Gyro Setup
+
+    SPI.begin(GYRO_CLK, GYRO_DI, GYRO_DO, GYRO_CS);
+    // Try to initialise and warn if we couldn't detect the chip
+    if (!gyro.begin(gyro.L3DS20_RANGE_250DPS, L3GD20_ADDRESS))
+    // if (!gyro.begin(gyro.L3DS20_RANGE_500DPS))
+    // if (!gyro.begin(gyro.L3DS20_RANGE_2000DPS))
+    {
+        Serial.println("Oops ... unable to initialize the L3GD20. Check your wiring!");
+        while (1)
+            ;
+    }
+    SerialPort.println("Gyro initialized");
 }
 
 void loop()
 {
-    server.handleClient();
-
-    tof_loop();
-    // tof_pc_loop();
+    // Subscribe to topic
+    sendData();
 }
 
 // HTML & CSS contents which display on web server
 // Handle root url (/)
-void handle_root()
+
+void sendData()
 {
-    server.send(200, "text/html", HTML);
+    VL53L4CX_MultiRangingData_t MultiRangingData;
+    VL53L4CX_MultiRangingData_t *pMultiRangingData = &MultiRangingData;
+    uint8_t NewDataReady = 0;
+    int no_of_object_found = 0, j;
+    char report[64];
+    int status;
+
+    do
+    {
+        status = sensor_vl53l4cx_sat.VL53L4CX_GetMeasurementDataReady(&NewDataReady);
+    } while (!NewDataReady);
+    // std::chrono::steady_clock::time_point begin = std::chrono::steady_clock::now();
+
+    if ((!status) && (NewDataReady != 0))
+    {
+        status = sensor_vl53l4cx_sat.VL53L4CX_GetMultiRangingData(pMultiRangingData);
+        no_of_object_found = pMultiRangingData->NumberOfObjectsFound;
+        // snprintf(report, sizeof(report), "VL53L4CX Satellite: Count=%d, #Objs=%1d ", pMultiRangingData->StreamCount, no_of_object_found);
+        // SerialPort.print(report);
+        for (j = 0; j < no_of_object_found; j++)
+        {
+            if (j != 0)
+            {
+                // SerialPort.print("\r\n                               ");
+            }
+
+            // SerialPort.print("status=");
+            // SerialPort.print(pMultiRangingData->RangeData[j].RangeStatus);
+            // SerialPort.print(", D=");
+            gyro.read();
+
+            String distance_data = String(pMultiRangingData->RangeData[j].RangeMilliMeter);
+            mqttClient.publish("distance", 2, true, distance_data.c_str());
+            mqttClient.publish("commands", 2, true, "running");
+
+            String xData = (String)gyro.data.x;
+            mqttClient.publish("xData", 2, true, xData.c_str());
+
+            String yData = (String)gyro.data.y;
+            mqttClient.publish("yData", 2, true, yData.c_str());
+
+            String zData = (String)gyro.data.z;
+            mqttClient.publish("zData", 2, true, zData.c_str());
+
+            delay(100);
+            // std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+            // std::cout << "Time difference = " << std::chrono::duration_cast<std::chrono::microseconds>(end - begin).count() << "[µs]" << std::endl;
+
+            // SerialPort.println((end - begin).count());
+
+            // SerialPort.print(", Signal=");
+            // SerialPort.print((float)pMultiRangingData->RangeData[j].SignalRateRtnMegaCps / 65536.0);
+            // SerialPort.print(" Mcps, Ambient=");
+            // SerialPort.print((float)pMultiRangingData->RangeData[j].AmbientRateRtnMegaCps / 65536.0);
+            // SerialPort.print(" Mcps");
+        }
+        SerialPort.println("");
+        if (status == 0)
+        {
+            status = sensor_vl53l4cx_sat.VL53L4CX_ClearInterruptAndStartMeasurement();
+        }
+    }
 }
+
