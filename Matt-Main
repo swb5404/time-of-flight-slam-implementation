@@ -34,8 +34,8 @@ float angle_z = 0;
 #define SDA = 21
 #define SCL = 22
 #define DEV_I2C Wire(SDA, SCL)
-// #define WIFI_SSID "Chance the Router"
-// #define WIFI_PASSWORD "anchor206arrow"
+// #define WIFI_SSID "***********"
+// #define WIFI_PASSWORD "*********"
 
 #define WIFI_SSID "iPhone."
 #define WIFI_PASSWORD "12345678"
